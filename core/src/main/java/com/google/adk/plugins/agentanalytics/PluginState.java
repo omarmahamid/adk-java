@@ -13,16 +13,23 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.VerifyException;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.jspecify.annotations.Nullable;
 import org.threeten.bp.Duration;
 
 /** Manages state for the BigQueryAgentAnalyticsPlugin. */
@@ -30,6 +37,7 @@ class PluginState {
   private static final Logger logger = Logger.getLogger(PluginState.class.getName());
   private final BigQueryLoggerConfig config;
   private final ScheduledExecutorService executor;
+  private final ExecutorService offloadExecutor;
   private final BigQueryWriteClient writeClient;
   private static final AtomicLong threadCounter = new AtomicLong(0);
   // Map of invocation ID to BatchProcessor.
@@ -39,12 +47,19 @@ class PluginState {
   private final ConcurrentHashMap<String, TraceManager> traceManagers = new ConcurrentHashMap<>();
   // Cache of invocation ID to Boolean indicating invocation ID has been processed.
   private final Cache<String, Boolean> processedInvocations;
+  private final GcsOffloader offloader;
+  private final Parser parser;
+  private final ConcurrentHashMap<String, Set<CompletableFuture<Void>>> pendingTasks =
+      new ConcurrentHashMap<>();
 
   PluginState(BigQueryLoggerConfig config) throws IOException {
     this.config = config;
-    ThreadFactory threadFactory =
-        r -> new Thread(r, "bq-analytics-plugin-" + threadCounter.getAndIncrement());
-    this.executor = Executors.newScheduledThreadPool(1, threadFactory);
+    this.executor =
+        Executors.newScheduledThreadPool(
+            2, r -> new Thread(r, "bq-analytics-plugin-" + threadCounter.getAndIncrement()));
+    this.offloadExecutor =
+        Executors.newCachedThreadPool(
+            r -> new Thread(r, "bq-analytics-plugin-offload-" + threadCounter.getAndIncrement()));
     // One write client per plugin instance, shared by all invocations.
     this.writeClient = createWriteClient(config);
     this.processedInvocations =
@@ -52,6 +67,13 @@ class PluginState {
             .maximumSize(10000)
             .expireAfterWrite(java.time.Duration.ofMinutes(10))
             .build();
+    this.offloader = getGcsOffloader(config);
+    this.parser =
+        new Parser(
+            offloader,
+            config.maxContentLength(),
+            config.connectionId().orElse(null),
+            config.logMultiModalContent());
   }
 
   ScheduledExecutorService getExecutor() {
@@ -132,6 +154,18 @@ class PluginState {
         });
   }
 
+  protected @Nullable GcsOffloader getGcsOffloader(BigQueryLoggerConfig config) {
+    if (config.gcsBucketName().isEmpty()) {
+      return null;
+    }
+    return new GcsOffloader(
+        config.projectId(), config.gcsBucketName(), offloadExecutor, config.credentials(), null);
+  }
+
+  Parser getParser() {
+    return parser;
+  }
+
   @VisibleForTesting
   Collection<TraceManager> getTraceManagers() {
     return traceManagers.values();
@@ -160,6 +194,47 @@ class PluginState {
     batchProcessors.clear();
   }
 
+  private Set<CompletableFuture<Void>> getPendingTasksForInvocation(String invocationId) {
+    return pendingTasks.computeIfAbsent(invocationId, k -> ConcurrentHashMap.newKeySet());
+  }
+
+  void addPendingTask(String invocationId, CompletableFuture<Void> task) {
+    Set<CompletableFuture<Void>> tasks = getPendingTasksForInvocation(invocationId);
+    tasks.add(task);
+    var unused = task.whenComplete((res, err) -> tasks.remove(task));
+  }
+
+  void waitForPendingTasks(String invocationId) {
+    Set<CompletableFuture<Void>> invocationTasks = pendingTasks.get(invocationId);
+    if (invocationTasks == null || invocationTasks.isEmpty()) {
+      pendingTasks.remove(invocationId);
+      return;
+    }
+    ImmutableList<CompletableFuture<Void>> tasks = ImmutableList.copyOf(invocationTasks);
+    logger.info(
+        "Waiting for " + tasks.size() + " pending tasks for invocation ID: " + invocationId);
+    try {
+      CompletableFuture.allOf(tasks.toArray(new CompletableFuture<?>[0]))
+          .get(config.shutdownTimeout().toMillis(), MILLISECONDS);
+    } catch (TimeoutException e) {
+      logger.log(
+          Level.WARNING,
+          "Timeout while waiting for pending tasks for invocation ID: " + invocationId,
+          e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      logger.log(
+          Level.WARNING,
+          "Interrupted while waiting for pending tasks for invocation ID: " + invocationId,
+          e);
+    } catch (ExecutionException e) {
+      logger.log(
+          Level.WARNING, "One or more pending tasks failed for invocation ID: " + invocationId, e);
+    }
+    logger.info("Finished waiting for pending tasks for invocation ID: " + invocationId);
+    pendingTasks.remove(invocationId);
+  }
+
   void close() {
     for (BatchProcessor processor : getBatchProcessors()) {
       processor.close();
@@ -175,12 +250,25 @@ class PluginState {
     }
     try {
       executor.shutdown();
+      offloadExecutor.shutdown();
       if (!executor.awaitTermination(config.shutdownTimeout().toMillis(), MILLISECONDS)) {
         executor.shutdownNow();
       }
+      if (!offloadExecutor.awaitTermination(config.shutdownTimeout().toMillis(), MILLISECONDS)) {
+        offloadExecutor.shutdownNow();
+      }
     } catch (InterruptedException e) {
       executor.shutdownNow();
+      offloadExecutor.shutdownNow();
       Thread.currentThread().interrupt();
+    }
+
+    try {
+      if (offloader != null) {
+        offloader.close();
+      }
+    } catch (Exception e) {
+      logger.log(Level.WARNING, "Failed to close GCS offloader", e);
     }
   }
 }

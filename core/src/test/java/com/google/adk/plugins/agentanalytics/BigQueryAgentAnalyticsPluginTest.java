@@ -17,17 +17,21 @@
 package com.google.adk.plugins.agentanalytics;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.adk.agents.BaseAgent;
@@ -75,6 +79,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -191,11 +196,83 @@ public class BigQueryAgentAnalyticsPluginTest {
   }
 
   @Test
+  public void onUserMessageCallback_ensuresInvocationSpan() throws Exception {
+    Content content = Content.builder().build();
+
+    // Verify initial state
+    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isEmpty());
+
+    plugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
+
+    // Verify that ensureInvocationSpan was called and created a span
+    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isPresent());
+  }
+
+  @Test
   public void beforeRunCallback_appendsToWriter() throws Exception {
     plugin.beforeRunCallback(mockInvocationContext).blockingSubscribe();
     state.getBatchProcessor("invocation_id").flush();
 
     verify(mockWriter, atLeastOnce()).append(any(ArrowRecordBatch.class));
+  }
+
+  @Test
+  public void beforeRunCallback_ensuresInvocationSpan() throws Exception {
+    // Verify initial state
+    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isEmpty());
+
+    plugin.beforeRunCallback(mockInvocationContext).blockingSubscribe();
+
+    // Verify that ensureInvocationSpan was called and created a span
+    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isPresent());
+  }
+
+  @Test
+  public void beforeRunCallback_addPendingTask() throws Exception {
+    final boolean[] addPendingTaskCalled = {false};
+    PluginState customState =
+        new PluginState(config) {
+          @Override
+          protected BigQueryWriteClient createWriteClient(BigQueryLoggerConfig config) {
+            return mockWriteClient;
+          }
+
+          @Override
+          protected StreamWriter createWriter() {
+            return mockWriter;
+          }
+
+          @Override
+          void addPendingTask(String invocationId, CompletableFuture<Void> task) {
+            super.addPendingTask(invocationId, task);
+            addPendingTaskCalled[0] = true;
+          }
+        };
+    BigQueryAgentAnalyticsPlugin customPlugin =
+        new BigQueryAgentAnalyticsPlugin(config, mockBigQuery, customState);
+
+    customPlugin.beforeRunCallback(mockInvocationContext).blockingSubscribe();
+
+    assertTrue("addPendingTask should have been called", addPendingTaskCalled[0]);
+  }
+
+  @Test
+  public void afterRunCallback_waitsForPendingTasks() throws Exception {
+    CompletableFuture<Void> pendingTask = new CompletableFuture<>();
+    String invocationId = "invocation_id";
+
+    // Manually add a pending task to the state
+    state.addPendingTask(invocationId, pendingTask);
+
+    // Complete the task after a short delay
+    var unused =
+        Executors.newSingleThreadScheduledExecutor()
+            .schedule(() -> pendingTask.complete(null), 100, MILLISECONDS);
+
+    // afterRunCallback should wait for the pending task
+    plugin.afterRunCallback(mockInvocationContext).blockingSubscribe();
+
+    assertTrue("Pending task should be completed after afterRunCallback", pendingTask.isDone());
   }
 
   @Test
@@ -225,7 +302,8 @@ public class BigQueryAgentAnalyticsPluginTest {
   @Test
   public void formatContentParts_populatesCorrectFields() {
     Content content = Content.fromParts(Part.fromText("hello"));
-    ArrayNode nodes = JsonFormatter.formatContentParts(Optional.of(content), 100);
+    ArrayNode nodes = state.getParser().formatContentParts(Optional.of(content));
+
     assertEquals(1, nodes.size());
     ObjectNode node = (ObjectNode) nodes.get(0);
     assertEquals(0, node.get("part_index").asInt());
@@ -966,6 +1044,88 @@ public class BigQueryAgentAnalyticsPluginTest {
     latch.await();
     assertEquals(numInvocations, processors.size());
     testExecutor.shutdown();
+  }
+
+  @Test
+  public void logEvent_offloadsToGcs_whenLargeContent() throws Exception {
+    GcsOffloader mockOffloader = mock(GcsOffloader.class);
+    when(mockOffloader.uploadContent(anyString(), anyString(), anyString()))
+        .thenReturn(CompletableFuture.completedFuture("gs://test-bucket/large.txt"));
+
+    BigQueryLoggerConfig gcsConfig = config.toBuilder().gcsBucketName("test-bucket").build();
+    PluginState gcsState =
+        new PluginState(gcsConfig) {
+          @Override
+          protected BigQueryWriteClient createWriteClient(BigQueryLoggerConfig config) {
+            return mockWriteClient;
+          }
+
+          @Override
+          protected StreamWriter createWriter() {
+            return mockWriter;
+          }
+
+          @Override
+          protected GcsOffloader getGcsOffloader(BigQueryLoggerConfig config) {
+            return mockOffloader;
+          }
+        };
+    BigQueryAgentAnalyticsPlugin gcsPlugin =
+        new BigQueryAgentAnalyticsPlugin(gcsConfig, mockBigQuery, gcsState);
+
+    // Large text (> 32KB default threshold)
+    String largeText = "a".repeat(40000);
+    Content content = Content.fromParts(Part.fromText(largeText));
+    gcsPlugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
+
+    verify(mockOffloader, atLeastOnce()).uploadContent(anyString(), anyString(), anyString());
+
+    Map<String, Object> row = gcsState.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull(row);
+    @SuppressWarnings("unchecked") // Test only
+    List<JsonNode> contentParts = (List<JsonNode>) row.get("content_parts");
+    assertEquals("GCS_REFERENCE", contentParts.get(0).get("storage_mode").asText());
+    assertEquals("gs://test-bucket/large.txt", contentParts.get(0).get("uri").asText());
+  }
+
+  @Test
+  public void logEvent_offloadsToGcs_whenMultimodalContent() throws Exception {
+    GcsOffloader mockOffloader = mock(GcsOffloader.class);
+    when(mockOffloader.uploadContent(any(byte[].class), anyString(), anyString()))
+        .thenReturn(CompletableFuture.completedFuture("gs://test-bucket/image.png"));
+
+    BigQueryLoggerConfig gcsConfig = config.toBuilder().gcsBucketName("test-bucket").build();
+    PluginState gcsState =
+        new PluginState(gcsConfig) {
+          @Override
+          protected BigQueryWriteClient createWriteClient(BigQueryLoggerConfig config) {
+            return mockWriteClient;
+          }
+
+          @Override
+          protected StreamWriter createWriter() {
+            return mockWriter;
+          }
+
+          @Override
+          protected GcsOffloader getGcsOffloader(BigQueryLoggerConfig config) {
+            return mockOffloader;
+          }
+        };
+    BigQueryAgentAnalyticsPlugin gcsPlugin =
+        new BigQueryAgentAnalyticsPlugin(gcsConfig, mockBigQuery, gcsState);
+
+    Content content = Content.fromParts(Part.fromBytes("test-data".getBytes(UTF_8), "image/png"));
+    gcsPlugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
+
+    verify(mockOffloader, atLeastOnce()).uploadContent(any(byte[].class), anyString(), anyString());
+
+    Map<String, Object> row = gcsState.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull(row);
+    @SuppressWarnings("unchecked") // Test only
+    List<JsonNode> contentParts = (List<JsonNode>) row.get("content_parts");
+    assertEquals("GCS_REFERENCE", contentParts.get(0).get("storage_mode").asText());
+    assertEquals("gs://test-bucket/image.png", contentParts.get(0).get("uri").asText());
   }
 
   private static class FakeAgent extends BaseAgent {
