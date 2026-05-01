@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.0](https://github.com/google/adk-java/compare/v1.2.0...v1.3.0) (2026-05-01)
+
+
+### Features
+
+* Add conversion from LlmRequest to ChatCompletionsRequest ([d37f6ee](https://github.com/google/adk-java/commit/d37f6ee6d8ec036154593b734f1a3b080847cfea))
+* Add support for refusal content using "[[REFUSAL]]:" prefix ([e9184c9](https://github.com/google/adk-java/commit/e9184c9846d97f65907667aa2a6bbac1f65fed64))
+
 ## [1.2.0](https://github.com/google/adk-java/compare/v1.1.0...v1.2.0) (2026-04-24)
 
 
